@@ -996,8 +996,6 @@ def main() -> None:
         )
     with col_b:
         linhas_preview = st.slider("Linhas de demonstração", 5, 30, 12, 1)
-    with col_c:
-        st.metric("Motor ativo", ENGINE_MODULE.replace("_", " "))
 
     card_inicio(
         "Prévia antes do processamento",
