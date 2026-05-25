@@ -3804,30 +3804,39 @@ def ler_congelado_dash_otimizado(
 
 def preparar_auxiliares_dash(
     sku_path: str | Path,
-    fabricante_path: str | Path,
-    avisos: List[str],
+    fabricante_path: str | Path | None = None,
+    avisos: List[str] | None = None,
     fabricante_filtro: str = "",
 ) -> pd.DataFrame:
     """
     Lê os arquivos auxiliares do modo Cobertura Dash.
 
     SKU: traz Código Barras, nome do SKU, Categoria Scanntech, NIVEL1, NIVEL2, vendas em volume/valor.
-    Congelado: traz Código Barras SKU/CODIGO_BARRAS_CONTENIDO, Marca SKU, Fabricante SKU e categorias congeladas.
+    Congelado opcional: traz Código Barras SKU/CODIGO_BARRAS_CONTENIDO, Marca SKU, Fabricante SKU e categorias congeladas.
     """
+    if avisos is None:
+        avisos = []
+
     sku_path = Path(sku_path)
-    fabricante_path = Path(fabricante_path)
+    fabricante_path = Path(fabricante_path) if fabricante_path else None
     if not sku_path.exists():
         raise FileNotFoundError(f"Arquivo SKU não encontrado: {sku_path}")
-    if not fabricante_path.exists():
-        raise FileNotFoundError(f"Arquivo Congelado não encontrado: {fabricante_path}")
 
     sku_raw = ler_tabela_primeira_linha(sku_path, ["SKU", "Dados", "Planilha1", "Sheet1"])
-    # O Congelado do Dash pode ser muito grande e pode vir como CSV/UTF-16
-    # mesmo quando a extensão parece Excel. Por isso ele é lido por uma rotina
-    # otimizada, que procura somente as colunas usadas no Dash:
-    # Código Barras SKU, CODIGO_BARRAS_CONTENIDO, Fabricante SKU,
-    # Categoría congelada ScannMarket, Est Mer 7, Nome SKU e Marca SKU.
-    fab = ler_congelado_dash_otimizado(fabricante_path, avisos, fabricante_filtro=fabricante_filtro)
+    # O Congelado do Dash é opcional. Quando informado, ele complementa Marca,
+    # Fabricante, categoria congelada e Est Mer 7. Quando não informado, o Dash
+    # segue com o arquivo SKU como fonte principal de categoria/PROD.
+    if fabricante_path and fabricante_path.exists():
+        fab = ler_congelado_dash_otimizado(fabricante_path, avisos, fabricante_filtro=fabricante_filtro)
+    else:
+        fab = pd.DataFrame(columns=[
+            "ean", "nome_sku_fab", "marca_fab", "fabricante_fab",
+            "categoria_fab", "estmer7_fab", "volume_fab", "valor_fab",
+        ])
+        avisos.append(
+            "Cobertura Dash: Congelado não informado. "
+            "O mapeamento seguirá pelo arquivo SKU; Marca, Fabricante e Est Mer 7 podem ficar vazios."
+        )
 
     c_sku_ean = localizar_coluna_ean_sku(sku_raw, obrigatoria=False)
     c_sku_nome = localizar_coluna(sku_raw, ["PROD_NOMBRE_ORIGINAL", "Nome SKU", "NOMBRE_SKU", "Descrição", "Descricao"], obrigatoria=False)
@@ -8647,7 +8656,7 @@ def executar_cobertura_dash(
     - Vendas UF do Dash com Dia de Selector Data, UF e Vendas Medida;
     - Vendas SKU opcional com Dia de Selector Data, EAN + Nome Sku e Vendas Medida;
     - arquivo SKU com Categoria Scanntech/NIVEL1/NIVEL2;
-    - arquivo Congelado com Marca/Fabricante e categoria congelada.
+    - arquivo Congelado opcional com Marca/Fabricante e categoria congelada.
 
     Quando Vendas UF não traz SKU/categoria, Vendas SKU é usado para distribuir
     Vendas UF por categoria/PROD. O resultado distribuído vira o Sell-out do Dash.
@@ -8678,17 +8687,18 @@ def executar_cobertura_dash(
     vendas_uf_file = Path(vendas_uf_path)
     vendas_sku_file = Path(vendas_sku_path) if vendas_sku_path else None
     sku_file = Path(sku_path)
-    congelado_file = Path(congelado_path)
+    congelado_file = Path(congelado_path) if congelado_path else None
     saida = Path(saida_path)
 
     for rotulo, caminho in [
         ("Sell-in", sellin_file),
         ("Vendas UF", vendas_uf_file),
         ("SKU", sku_file),
-        ("Congelado", congelado_file),
     ]:
         if not caminho.exists():
             raise FileNotFoundError(f"Arquivo {rotulo} não encontrado: {caminho}")
+    if congelado_file is not None and not congelado_file.exists():
+        raise FileNotFoundError(f"Arquivo Congelado não encontrado: {congelado_file}")
     if vendas_sku_file is not None and not vendas_sku_file.exists():
         raise FileNotFoundError(f"Arquivo Vendas SKU não encontrado: {vendas_sku_file}")
     if saida.suffix.lower() != ".xlsx":
@@ -8700,7 +8710,7 @@ def executar_cobertura_dash(
     sellin_raw, av = ler_sellin(sellin_file, metrica)
     avisos.extend(av)
 
-    log("Lendo arquivos auxiliares SKU e Congelado...", 14)
+    log("Lendo arquivos auxiliares do Dash...", 14)
     aux_dash = preparar_auxiliares_dash(
         sku_file,
         congelado_file,
@@ -11320,7 +11330,7 @@ def main():
 
     if getattr(args, "modo", "estudo") == "dash":
         vendas_uf_arg = args.vendas_uf or args.sellout
-        precisa_gui = not (args.sellin and vendas_uf_arg and args.sku and args.arquivo_fabricante and args.saida and args.metrica and args.nivel)
+        precisa_gui = not (args.sellin and vendas_uf_arg and args.sku and args.saida and args.metrica and args.nivel)
         if precisa_gui:
             cfg = obter_configuracao_gui(args)
             if not cfg:
@@ -11331,7 +11341,7 @@ def main():
             args.sellin,
             vendas_uf_arg,
             args.sku,
-            args.arquivo_fabricante,
+            args.arquivo_fabricante or "",
             args.saida,
             args.metrica.lower(),
             args.nivel.upper(),

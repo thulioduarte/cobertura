@@ -1,14 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Interface para o Estudo de Cobertura.
+Interface Streamlit profissional para o Estudo de Cobertura.
 
 Como usar:
-1) Este pacote já vem com o app.py e o motor:
+1) Salve este arquivo na mesma pasta do motor:
    gerar_estudo_cobertura_anexo_corrigido.py
 2) Instale as dependências:
    pip install streamlit pandas openpyxl xlsxwriter numpy
 3) Execute:
-   streamlit run app.py
+   streamlit run app_streamlit_profissional.py
 
 Observação:
 - Este app não altera a lógica do estudo.
@@ -18,12 +18,9 @@ Observação:
 from __future__ import annotations
 
 import importlib
-import importlib.util
 import inspect
 import os
-import sys
 import tempfile
-import traceback
 from pathlib import Path
 from typing import Dict, Iterable, Optional, Tuple
 
@@ -36,17 +33,12 @@ import streamlit as st
 # ============================================================
 
 LOGO_URL = "https://attachments.gupy.io/production/companies/37162/career/77428/images/2023-10-05_14-45_companyLogoUrl.png"
-APP_DIR = Path(__file__).resolve().parent
 ENGINE_MODULE = os.getenv("COBERTURA_ENGINE_MODULE", "gerar_estudo_cobertura_anexo_corrigido")
-ENGINE_FILE = APP_DIR / f"{ENGINE_MODULE}.py"
-
-# Garante que o Streamlit encontre o motor mesmo quando o comando for executado
-# a partir de outra pasta.
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
 
 APP_TITLE = "Estudo de Cobertura"
 APP_SUBTITLE = "Análise Sell-in x Sell-out com validações, escala de volumetria e geração de Excel analítico."
+MANUAL_FILE = "Manual de Uso - Estudo de Cobertura.docx"
+BOAS_PRATICAS_FILE = "Boas Praticas - Estudo de Cobertura.md"
 
 METRICAS = {
     "Volume": "volume",
@@ -79,7 +71,7 @@ OPCOES_PADRAO = {
     "resumo_categorias": True,
     "abas_categorias": True,
     "base_skus": True,
-    "base_contribuicao_sellout": True,
+    "base_contribuicao_sellout": False,
     "skus_por_categoria": True,
     "crosschecks": True,
     "parametros": True,
@@ -426,20 +418,6 @@ def render_steps() -> None:
 
 @st.cache_resource(show_spinner=False)
 def carregar_motor():
-    """Carrega o motor do estudo a partir da própria pasta do app.
-
-    Isso evita o erro "No module named gerar_estudo_cobertura_anexo_corrigido"
-    quando o Streamlit é iniciado fora da pasta onde o app está salvo.
-    """
-    if ENGINE_FILE.exists():
-        spec = importlib.util.spec_from_file_location(ENGINE_MODULE, ENGINE_FILE)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Não foi possível criar o spec de importação para: {ENGINE_FILE}")
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules[ENGINE_MODULE] = mod
-        spec.loader.exec_module(mod)
-        return mod
-
     return importlib.import_module(ENGINE_MODULE)
 
 
@@ -447,8 +425,8 @@ def motor_disponivel() -> Tuple[bool, Optional[object], str]:
     try:
         mod = carregar_motor()
         return True, mod, ""
-    except Exception:
-        return False, None, traceback.format_exc()
+    except Exception as exc:
+        return False, None, str(exc)
 
 
 def safe_call(func, *args, **kwargs):
@@ -558,6 +536,41 @@ def render_preview(uploaded_file, titulo: str, linhas: int) -> None:
         st.dataframe(df_prev, use_container_width=True, height=min(420, 82 + 28 * max(len(df_prev), 3)))
 
 
+def download_arquivo_lateral(caminho: Path, rotulo: str, mime: str) -> None:
+    if caminho.exists():
+        st.download_button(
+            rotulo,
+            data=caminho.read_bytes(),
+            file_name=caminho.name,
+            mime=mime,
+            use_container_width=True,
+        )
+    else:
+        st.caption(f"Arquivo não localizado: {caminho.name}")
+
+
+def seletor_congelado_opcional(prefixo_key: str, linhas_preview: int, texto_ajuda: str):
+    usar_congelado = st.checkbox(
+        "Usar Congelado opcional",
+        value=False,
+        key=f"{prefixo_key}_usar_congelado",
+        help=texto_ajuda,
+    )
+    if not usar_congelado:
+        st.caption("Congelado não será usado neste processamento. Marque a opção acima somente quando precisar apoiar o mapeamento por SKU/EAN.")
+        return None
+
+    with st.expander("Carregar Congelado opcional", expanded=True):
+        congelado = st.file_uploader(
+            "Congelado",
+            type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"],
+            key=f"{prefixo_key}_congelado",
+        )
+        render_file_status("Congelado opcional", congelado)
+        render_preview(congelado, "Congelado opcional", linhas_preview)
+        return congelado
+
+
 def seletor_configuracoes(prefixo_key: str = "") -> Tuple[str, str, str]:
     c1, c2, c3 = st.columns([1.0, 1.0, 1.4])
 
@@ -613,27 +626,41 @@ def painel_lateral(ok_motor: bool, erro_motor: str) -> None:
     with st.sidebar:
         st.image(LOGO_URL, width=112)
         st.markdown("### Painel de execução")
-        st.caption("Interface profissional para geração do Estudo de Cobertura.")
+        st.caption("Geração do Estudo de Cobertura em Excel.")
 
-        if ok_motor:
-            st.success(f"Motor carregado: `{ENGINE_MODULE}.py`")
-        else:
+        if not ok_motor:
             st.error("Motor não carregado.")
             st.caption(erro_motor)
 
         st.divider()
+        st.markdown("#### Manual de Uso")
+        st.caption("Baixe o manual atualizado com o fluxo do Streamlit, parâmetros e leitura dos resultados.")
+        pasta_app = Path(__file__).resolve().parent
+        download_arquivo_lateral(
+            pasta_app / MANUAL_FILE,
+            "Baixar Manual de Uso",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+
+        st.divider()
         st.markdown("#### Boas práticas")
-        st.caption("• Deixe o arquivo do motor na mesma pasta deste app.")
-        st.caption("• Use arquivos Excel/CSV no padrão esperado pelo código.")
-        st.caption("• Confira a prévia antes de gerar o estudo.")
-        st.caption("• Evite desmarcar todas as abas de saída.")
+        with st.expander("Ver boas práticas", expanded=True):
+            st.caption("• Use Sell-in mensal, sem MAT/YTD agregado como mês.")
+            st.caption("• Escolha a mesma métrica entre Sell-in e Sell-out: volume ou quantidade.")
+            st.caption("• Use filtro de fabricante para reduzir arquivos grandes.")
+            st.caption("• Use Congelado somente quando precisar apoiar o mapeamento por SKU/EAN.")
+            st.caption("• Revise a aba Avisos antes de interpretar a cobertura final.")
+        download_arquivo_lateral(
+            pasta_app / BOAS_PRATICAS_FILE,
+            "Baixar Boas Práticas",
+            "text/markdown",
+        )
 
         st.divider()
         if st.button("Limpar cache da interface"):
             st.cache_data.clear()
             st.cache_resource.clear()
             st.rerun()
-
 
 def log_streamlit_factory(status_placeholder, progress_bar, log_area):
     linhas_log = []
@@ -720,27 +747,28 @@ def requeridos_ok(arquivos: Iterable) -> bool:
 
 def tela_estudo_individual(motor, linhas_preview: int, output_options: Dict[str, bool]) -> None:
     st.markdown('<div class="section-title">Estudo individual</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Use um Sell-in, um Sell-out e, opcionalmente, um Congelado para apoiar categoria por SKU.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Use um Sell-in e um Sell-out. O Congelado fica recolhido e só aparece se você ativar a opção.</div>', unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         sellin = st.file_uploader("Sell-in", type=["xlsx", "xlsm", "xls"], key="estudo_sellin")
     with c2:
         sellout = st.file_uploader("Sell-out", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="estudo_sellout")
-    with c3:
-        congelado = st.file_uploader("Congelado opcional", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="estudo_congelado")
 
-    s1, s2, s3 = st.columns(3)
+    s1, s2 = st.columns(2)
     with s1:
         render_file_status("Sell-in", sellin)
     with s2:
         render_file_status("Sell-out", sellout)
-    with s3:
-        render_file_status("Congelado opcional", congelado)
 
     render_preview(sellin, "Sell-in", linhas_preview)
     render_preview(sellout, "Sell-out", linhas_preview)
-    render_preview(congelado, "Congelado opcional", linhas_preview)
+
+    congelado = seletor_congelado_opcional(
+        "estudo",
+        linhas_preview,
+        "Use apenas se precisar que a categoria dos SKUs seja apoiada pelo Congelado.",
+    )
 
     metrica, nivel, fabricante = seletor_configuracoes("estudo")
 
@@ -778,30 +806,31 @@ def tela_estudo_dois_sellouts(motor, linhas_preview: int, output_options: Dict[s
     st.markdown('<div class="section-title">Estudo com 2 Sell-outs</div>', unsafe_allow_html=True)
     st.markdown('<div class="section-subtitle">Use o mesmo Sell-in para comparar Sell-out 2.0 x Sell-out 3.0 em um único Excel final.</div>', unsafe_allow_html=True)
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         sellin = st.file_uploader("Sell-in", type=["xlsx", "xlsm", "xls"], key="dois_sellin")
     with c2:
         sellout20 = st.file_uploader("Sell-out 2.0", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dois_sellout20")
     with c3:
         sellout30 = st.file_uploader("Sell-out 3.0", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dois_sellout30")
-    with c4:
-        congelado = st.file_uploader("Congelado opcional", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dois_congelado")
 
-    s1, s2, s3, s4 = st.columns(4)
+    s1, s2, s3 = st.columns(3)
     with s1:
         render_file_status("Sell-in", sellin)
     with s2:
         render_file_status("Sell-out 2.0", sellout20)
     with s3:
         render_file_status("Sell-out 3.0", sellout30)
-    with s4:
-        render_file_status("Congelado opcional", congelado)
 
     render_preview(sellin, "Sell-in", linhas_preview)
     render_preview(sellout20, "Sell-out 2.0", linhas_preview)
     render_preview(sellout30, "Sell-out 3.0", linhas_preview)
-    render_preview(congelado, "Congelado opcional", linhas_preview)
+
+    congelado = seletor_congelado_opcional(
+        "dois",
+        linhas_preview,
+        "Use apenas se quiser apoiar a categoria dos SKUs pelo Congelado nos dois Sell-outs.",
+    )
 
     metrica, nivel, fabricante = seletor_configuracoes("dois")
     gerar_top20 = st.checkbox(
@@ -845,7 +874,7 @@ def tela_estudo_dois_sellouts(motor, linhas_preview: int, output_options: Dict[s
 
 def tela_dash(motor, linhas_preview: int, output_options: Dict[str, bool]) -> None:
     st.markdown('<div class="section-title">Cobertura Dash</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-subtitle">Use Sell-in, Vendas UF, SKU e Congelado. Vendas SKU é opcional para distribuir por categoria/PROD.</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-subtitle">Use Sell-in, Vendas UF e SKU. Vendas SKU e Congelado são opcionais conforme a necessidade da análise.</div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -855,13 +884,13 @@ def tela_dash(motor, linhas_preview: int, output_options: Dict[str, bool]) -> No
     with c3:
         vendas_sku = st.file_uploader("Vendas SKU opcional", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dash_vendas_sku")
 
-    c4, c5 = st.columns(2)
+    c4, c5 = st.columns([1, 1])
     with c4:
         sku = st.file_uploader("Arquivo SKU", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dash_sku")
     with c5:
-        congelado = st.file_uploader("Congelado", type=["xlsx", "xlsm", "xls", "csv", "txt", "tsv"], key="dash_congelado")
+        st.info("Congelado é opcional. Ative abaixo somente se precisar usar Marca/Fabricante/Est Mer 7 da Base Congelada.")
 
-    s1, s2, s3, s4, s5 = st.columns(5)
+    s1, s2, s3, s4 = st.columns(4)
     with s1:
         render_file_status("Sell-in", sellin)
     with s2:
@@ -870,19 +899,22 @@ def tela_dash(motor, linhas_preview: int, output_options: Dict[str, bool]) -> No
         render_file_status("Vendas SKU opcional", vendas_sku)
     with s4:
         render_file_status("SKU", sku)
-    with s5:
-        render_file_status("Congelado", congelado)
 
     render_preview(sellin, "Sell-in", linhas_preview)
     render_preview(vendas_uf, "Vendas UF", linhas_preview)
     render_preview(vendas_sku, "Vendas SKU opcional", linhas_preview)
     render_preview(sku, "SKU", linhas_preview)
-    render_preview(congelado, "Congelado", linhas_preview)
+
+    congelado = seletor_congelado_opcional(
+        "dash",
+        linhas_preview,
+        "Use se precisar complementar Marca, Fabricante, categoria congelada ou Est Mer 7 a partir da Base Congelada.",
+    )
 
     metrica, nivel, fabricante = seletor_configuracoes("dash")
 
-    if not requeridos_ok([sellin, vendas_uf, sku, congelado]):
-        st.warning("Envie Sell-in, Vendas UF, SKU e Congelado para liberar a geração do modo Dash.")
+    if not requeridos_ok([sellin, vendas_uf, sku]):
+        st.warning("Envie Sell-in, Vendas UF e SKU para liberar a geração do modo Dash. O Congelado é opcional.")
         return
 
     def executar(log_callback):
@@ -892,7 +924,7 @@ def tela_dash(motor, linhas_preview: int, output_options: Dict[str, bool]) -> No
             p_vendas_uf = salvar_upload(vendas_uf, tmp, "vendas_uf")
             p_vendas_sku = salvar_upload(vendas_sku, tmp, "vendas_sku") if vendas_sku is not None else None
             p_sku = salvar_upload(sku, tmp, "sku")
-            p_congelado = salvar_upload(congelado, tmp, "congelado")
+            p_congelado = salvar_upload(congelado, tmp, "congelado") if congelado is not None else ""
             p_saida = tmp / nome_saida("cobertura_dash")
 
             resultado = safe_call(
@@ -987,7 +1019,7 @@ def main() -> None:
         st.code(erro_motor, language="text")
         return
 
-    col_a, col_b, col_c = st.columns([1.2, 1.2, 1.1])
+    col_a, col_b = st.columns([1.4, 1.0])
     with col_a:
         modo = st.radio(
             "Modo de geração",
