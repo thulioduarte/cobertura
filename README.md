@@ -27,8 +27,3 @@ Também é possível executar `instalar_dependencias.bat` e depois `run_streamli
 - `Congelado` exibido de forma discreta: só aparece após marcar `Usar Congelado opcional`.
 - Manual de Uso e Boas Práticas adicionados no painel lateral, com botão de download.
 - Manual atualizado com imagens novas da interface Streamlit.
-
-
-## Dependências extras desta versão
-
-- `matplotlib`: usado para gerar a aba `Gráficos Cobertura` como imagem estática no mesmo padrão visual do PPT.

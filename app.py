@@ -63,7 +63,6 @@ OPCOES_SAIDA = {
     "parametros": "Parâmetros",
     "descricao_calculos": "Descrição Cálculos",
     "avisos": "Avisos",
-    "graficos_cobertura": "Gráficos Cobertura",
     "abas_auxiliares_comparacao": "Abas auxiliares da comparação",
     "top20_sku_canal_uf": "TOP 20 SKU por UF/Canal",
 }
@@ -78,7 +77,6 @@ OPCOES_PADRAO = {
     "parametros": True,
     "descricao_calculos": True,
     "avisos": True,
-    "graficos_cobertura": True,
     "abas_auxiliares_comparacao": True,
     "top20_sku_canal_uf": False,
 }

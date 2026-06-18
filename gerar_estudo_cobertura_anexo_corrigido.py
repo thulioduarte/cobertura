@@ -5469,6 +5469,84 @@ def somar_periodo_dataframe(df: pd.DataFrame, coluna_valor: str, inicio, fim, co
     mask = (temp[coluna_mes] >= inicio) & (temp[coluna_mes] <= fim)
     return float(pd.to_numeric(temp.loc[mask, coluna_valor], errors="coerce").fillna(0).sum())
 
+def filtrar_periodo_calculo(df: pd.DataFrame, inicio, fim, modo_periodo: str) -> pd.DataFrame:
+    """Filtra uma base pelo mesmo período usado no cálculo superior da aba.
+
+    Em modo mensal usa a coluna mes. Em modo anual usa a coluna ano.
+    Se o período estiver indisponível, devolve a base completa para manter o fallback total.
+    """
+    if df is None:
+        return pd.DataFrame()
+    if df.empty:
+        return df.copy()
+    if pd.isna(inicio) or pd.isna(fim):
+        return df.copy()
+
+    out = df.copy()
+    modo = str(modo_periodo or "").lower()
+    if modo == "mensal" and "mes" in out.columns:
+        out["_mes_periodo_calc"] = pd.to_datetime(out["mes"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+        mask = (out["_mes_periodo_calc"] >= pd.Timestamp(inicio).to_period("M").to_timestamp()) & (out["_mes_periodo_calc"] <= pd.Timestamp(fim).to_period("M").to_timestamp())
+        return out.loc[mask].drop(columns=["_mes_periodo_calc"], errors="ignore").copy()
+
+    if modo == "anual" and "ano" in out.columns:
+        ano_ini = int(pd.Timestamp(inicio).year)
+        ano_fim = int(pd.Timestamp(fim).year)
+        anos = pd.to_numeric(out["ano"], errors="coerce")
+        return out.loc[(anos >= ano_ini) & (anos <= ano_fim)].copy()
+
+    return out.copy()
+
+
+def somar_sku_comum_no_periodo(si: pd.DataFrame, so: pd.DataFrame, inicio, fim, modo_periodo: str) -> Tuple[float, float, int]:
+    """Soma Sell-in/Sell-out apenas dos SKUs em comum no mesmo período informado."""
+    si_p = filtrar_periodo_calculo(si, inicio, fim, modo_periodo)
+    so_p = filtrar_periodo_calculo(so, inicio, fim, modo_periodo)
+    skus = skus_comuns_sellin_sellout(si_p, so_p)
+    if not skus:
+        return 0.0, 0.0, 0
+    si_val = float(pd.to_numeric(si_p.loc[si_p["ean"].map(ean_texto).isin(skus), "valor_sellin"], errors="coerce").fillna(0).sum()) if "ean" in si_p.columns else 0.0
+    so_val = float(pd.to_numeric(so_p.loc[so_p["ean"].map(ean_texto).isin(skus), "valor_sellout"], errors="coerce").fillna(0).sum()) if "ean" in so_p.columns else 0.0
+    return si_val, so_val, len(skus)
+
+
+def montar_resumo_sku_comum_mesmo_periodo(si: pd.DataFrame, so: pd.DataFrame, periodos: Dict[str, object], modo_periodo: str) -> pd.DataFrame:
+    """Replica o bloco superior, mas calculando somente SKUs em comum.
+
+    A regra é intencionalmente igual à tabela de cima da aba: usa o mesmo período
+    anterior e o mesmo período atual definidos em `periodos`; a única diferença é
+    restringir as somas aos SKUs/EANs existentes nos dois lados dentro de cada período.
+    """
+    label_ant = periodos.get("label_anterior", "Período anterior")
+    label_atual = periodos.get("label_atual", "Período atual")
+    ia, fa = periodos.get("inicio_anterior"), periodos.get("fim_anterior")
+    it, ft = periodos.get("inicio_atual"), periodos.get("fim_atual")
+
+    si_ant, so_ant, skus_ant = somar_sku_comum_no_periodo(si, so, ia, fa, modo_periodo)
+    si_atual, so_atual, skus_atual = somar_sku_comum_no_periodo(si, so, it, ft, modo_periodo)
+    cov_ant = divisao_segura(so_ant, si_ant)
+    cov_atual = divisao_segura(so_atual, si_atual)
+
+    out = pd.DataFrame({
+        "Indicador": ["Sell-in", "Sell-out", "Cobertura", "Qtd SKUs em comum"],
+        label_ant: [si_ant, so_ant, cov_ant, skus_ant],
+        label_atual: [si_atual, so_atual, cov_atual, skus_atual],
+        "Tendência %": [
+            variacao(si_atual, si_ant),
+            variacao(so_atual, so_ant),
+            variacao(cov_atual, cov_ant),
+            np.nan,
+        ],
+    })
+    return out
+
+
+def skus_comuns_do_periodo_atual(si: pd.DataFrame, so: pd.DataFrame, periodos: Dict[str, object], modo_periodo: str) -> set:
+    """Retorna os SKUs comuns do período atual do cálculo superior."""
+    si_p = filtrar_periodo_calculo(si, periodos.get("inicio_atual"), periodos.get("fim_atual"), modo_periodo)
+    so_p = filtrar_periodo_calculo(so, periodos.get("inicio_atual"), periodos.get("fim_atual"), modo_periodo)
+    return skus_comuns_sellin_sellout(si_p, so_p)
+
 
 def montar_resumo_mat_movel_individual(mensal: pd.DataFrame, max_mes: pd.Timestamp) -> Tuple[Dict[str, object], pd.DataFrame]:
     """Monta a tabela MAT móvel. Só calcula MAT quando existem 24 meses completos."""
@@ -5557,6 +5635,13 @@ def calcular_cobertura_total_disponivel(
         "Cobertura SKU em Comum": [divisao_segura(so_comum_atual, si_comum_atual)],
     })
 
+    resumo_sku_comum = pd.DataFrame({
+        "Indicador": ["Sell-in", "Sell-out", "Cobertura", "Qtd SKUs em comum"],
+        periodos["label_anterior"]: [np.nan, np.nan, np.nan, np.nan],
+        periodos["label_atual"]: [si_comum_atual, so_comum_atual, divisao_segura(so_comum_atual, si_comum_atual), len(skus_comuns)],
+        "Tendência %": [np.nan, np.nan, np.nan, np.nan],
+    })
+
     if "uf" in si.columns and "uf" in so.columns:
         uf = montar_tabela_uf_comparacao(si, so)
     else:
@@ -5572,6 +5657,7 @@ def calcular_cobertura_total_disponivel(
         "resumo_6m": resumo_6m,
         "resumo_mat_movel": resumo_periodo.copy(),
         "periodos_mat_movel": periodos.copy(),
+        "resumo_sku_comum": resumo_sku_comum,
         "mensal": mensal_saida,
         "uf": uf,
         "skus_excluidos": montar_skus_excluidos_em_comum(si, so),
@@ -5647,11 +5733,14 @@ def calcular_cobertura_categoria(
 
         periodos = determinar_periodos_mat_ou_ytd(meses, max_mes)
 
-        # SKU em comum sempre identificado pela janela de 12 meses da categoria/PROD.
-        si_sku_12m, so_sku_12m = filtrar_bases_sku_12m_por_categoria(si, so)
-        skus_comuns = skus_comuns_sellin_sellout(si_sku_12m, so_sku_12m)
-        si_comum = si[si["ean"].map(ean_texto).isin(skus_comuns)].copy() if skus_comuns and "ean" in si.columns else si.iloc[0:0].copy()
-        so_comum = so[so["ean"].map(ean_texto).isin(skus_comuns)].copy() if skus_comuns and "ean" in so.columns else so.iloc[0:0].copy()
+        # SKU em comum segue o mesmo período definido na tabela superior.
+        # Ou seja: usa o período anterior/atual de `periodos` e muda apenas o filtro para SKUs presentes nos dois lados.
+        resumo_sku_comum = montar_resumo_sku_comum_mesmo_periodo(si, so, periodos, "mensal")
+        skus_comuns = skus_comuns_do_periodo_atual(si, so, periodos, "mensal")
+        si_periodo_atual_comum = filtrar_periodo_calculo(si, periodos.get("inicio_atual"), periodos.get("fim_atual"), "mensal")
+        so_periodo_atual_comum = filtrar_periodo_calculo(so, periodos.get("inicio_atual"), periodos.get("fim_atual"), "mensal")
+        si_comum = si_periodo_atual_comum[si_periodo_atual_comum["ean"].map(ean_texto).isin(skus_comuns)].copy() if skus_comuns and "ean" in si_periodo_atual_comum.columns else si.iloc[0:0].copy()
+        so_comum = so_periodo_atual_comum[so_periodo_atual_comum["ean"].map(ean_texto).isin(skus_comuns)].copy() if skus_comuns and "ean" in so_periodo_atual_comum.columns else so.iloc[0:0].copy()
 
         si_mensal = si.groupby("mes", as_index=False)["valor_sellin"].sum()
         so_mensal = so.groupby("mes", as_index=False)["valor_sellout"].sum()
@@ -5674,11 +5763,9 @@ def calcular_cobertura_categoria(
         sellin_12m = mensal["valor_sellin"].rolling(window=MESES_MAT, min_periods=MESES_MAT).sum()
         sellout_12m = mensal["valor_sellout"].rolling(window=MESES_MAT, min_periods=MESES_MAT).sum()
         mensal["cobertura"] = sellout_12m / sellin_12m.replace(0, np.nan)
-        sellin_comum_12m = mensal["valor_sellin_comum"].rolling(window=MESES_MAT, min_periods=MESES_MAT).sum()
-        sellout_comum_12m = mensal["valor_sellout_comum"].rolling(window=MESES_MAT, min_periods=MESES_MAT).sum()
-        mensal["valor_sellin_comum_12m"] = sellin_comum_12m
-        mensal["valor_sellout_comum_12m"] = sellout_comum_12m
-        mensal["cobertura_sku_comum"] = sellout_comum_12m / sellin_comum_12m.replace(0, np.nan)
+        mensal["valor_sellin_comum_periodo"] = mensal["valor_sellin_comum"]
+        mensal["valor_sellout_comum_periodo"] = mensal["valor_sellout_comum"]
+        mensal["cobertura_sku_comum"] = mensal["valor_sellout_comum"] / mensal["valor_sellin_comum"].replace(0, np.nan)
 
         periodos_mat_movel, resumo_mat_movel = montar_resumo_mat_movel_individual(mensal, max_mes)
 
@@ -5728,13 +5815,13 @@ def calcular_cobertura_categoria(
                 "Tendência %": [np.nan, np.nan, np.nan],
             })
 
-        mensal_saida = mensal[["mes", "valor_sellin", "valor_sellout", "cobertura", "valor_sellin_comum_12m", "valor_sellout_comum_12m", "cobertura_sku_comum"]].rename(columns={
+        mensal_saida = mensal[["mes", "valor_sellin", "valor_sellout", "cobertura", "valor_sellin_comum_periodo", "valor_sellout_comum_periodo", "cobertura_sku_comum"]].rename(columns={
             "mes": "Mês",
             "valor_sellin": "Sell-in",
             "valor_sellout": "Sell-out",
             "cobertura": "Cobertura 12M Móvel",
-            "valor_sellin_comum_12m": "Sell-in SKU em Comum",
-            "valor_sellout_comum_12m": "Sell-out SKU em Comum",
+            "valor_sellin_comum_periodo": "Sell-in SKU em Comum",
+            "valor_sellout_comum_periodo": "Sell-out SKU em Comum",
             "cobertura_sku_comum": "Cobertura SKU em Comum",
         })
 
@@ -5847,6 +5934,9 @@ def calcular_cobertura_categoria(
         if col not in mensal_saida.columns:
             mensal_saida[col] = np.nan
 
+    if "resumo_sku_comum" not in locals():
+        resumo_sku_comum = montar_resumo_sku_comum_mesmo_periodo(si, so, periodos, modo_periodo)
+
     # Tabela por UF: só usa o que existir. Se não houver UF, ambos terão TOTAL.
     # Em modo mensal, usa sempre a janela de 12 meses móveis, alinhada ao cálculo de cobertura.
     inicio_atual = periodos.get("inicio_atual")
@@ -5881,6 +5971,7 @@ def calcular_cobertura_categoria(
         "resumo_6m": resumo_6m,
         "resumo_mat_movel": resumo_mat_movel,
         "periodos_mat_movel": periodos_mat_movel,
+        "resumo_sku_comum": resumo_sku_comum,
         "mensal": mensal_saida,
         "uf": uf,
         "skus_excluidos": montar_skus_excluidos_em_comum(si, so),
@@ -6367,17 +6458,57 @@ def escrever_categoria(writer, nome_aba: str, resultado: Dict[str, object]):
         chart.set_chartarea({"border": {"color": "#BFBFBF"}})
         ws.insert_chart(chart_row, 1, chart)
 
-    # Tabela separada de SKU em comum, abaixo do gráfico principal.
+    # Tabela separada de SKU em comum, usando o mesmo período da tabela superior.
     sku_title_row = chart_row + 18
-    ws.merge_range(sku_title_row, 1, sku_title_row, 4, "SKU em Comum", fmt_secao)
+    resumo_sku_comum = limpar_dataframe_excel(resultado.get("resumo_sku_comum", pd.DataFrame()))
+    if resumo_sku_comum.empty:
+        resumo_sku_comum = pd.DataFrame({
+            "Indicador": ["Sell-in", "Sell-out", "Cobertura"],
+            str(label_ant): [np.nan, np.nan, np.nan],
+            str(label_atual): [np.nan, np.nan, np.nan],
+            "Tendência %": [np.nan, np.nan, np.nan],
+        })
+
+    cols_sku_resumo = list(resumo_sku_comum.columns)
+    largura_sku_resumo = max(4, len(cols_sku_resumo))
+    ws.merge_range(sku_title_row, 1, sku_title_row, largura_sku_resumo, "SKU em Comum - mesmo período do cálculo superior", fmt_secao)
     sku_header_row = sku_title_row + 1
-    for j, header in enumerate(["Data", "Sell-in", "Sell-out", "Cobertura"], start=1):
+    for j, header in enumerate(cols_sku_resumo, start=1):
         ws.write(sku_header_row, j, header, fmt_header)
 
     primeira_sku_row = sku_header_row + 1
-    for i in range(len(mensal)):
+    for i, (_, linha_sku) in enumerate(resumo_sku_comum.reset_index(drop=True).iterrows()):
         row = primeira_sku_row + i
-        mes_val = mensal.iloc[i].get("Mês", "")
+        indicador_sku = str(linha_sku.get("Indicador", ""))
+        for j, header in enumerate(cols_sku_resumo, start=1):
+            val = linha_sku.get(header, np.nan)
+            if header == "Indicador":
+                ws.write(row, j, indicador_sku, fmt_text_center)
+            elif "Tendência" in str(header) or indicador_sku == "Cobertura":
+                write_number_ou_branco(ws, row, j, val, fmt_pct)
+            elif "Qtd" in indicador_sku:
+                write_number_ou_branco(ws, row, j, val, fmt_num)
+            else:
+                write_number_ou_branco(ws, row, j, val, fmt_num)
+
+    # Detalhe mensal de apoio: mostra os meses do período atual do cálculo superior,
+    # mas sem recalcular 12M. A cobertura mensal é Sell-out comum / Sell-in comum.
+    detalhe_sku_title_row = primeira_sku_row + max(len(resumo_sku_comum), 1) + 2
+    ws.merge_range(detalhe_sku_title_row, 1, detalhe_sku_title_row, 4, "Detalhe mensal do SKU em Comum - período atual", fmt_secao)
+    detalhe_sku_header_row = detalhe_sku_title_row + 1
+    for j, header in enumerate(["Data", "Sell-in", "Sell-out", "Cobertura"], start=1):
+        ws.write(detalhe_sku_header_row, j, header, fmt_header)
+
+    inicio_sku_atual = periodos.get("inicio_atual")
+    fim_sku_atual = periodos.get("fim_atual")
+    mensal_sku_detalhe = mensal.copy()
+    if resultado.get("modo_periodo") == "mensal" and pd.notna(inicio_sku_atual) and pd.notna(fim_sku_atual):
+        mensal_sku_detalhe = mensal_sku_detalhe[(pd.to_datetime(mensal_sku_detalhe["Mês"], errors="coerce") >= pd.Timestamp(inicio_sku_atual)) & (pd.to_datetime(mensal_sku_detalhe["Mês"], errors="coerce") <= pd.Timestamp(fim_sku_atual))].copy()
+
+    primeira_sku_detalhe_row = detalhe_sku_header_row + 1
+    for i in range(len(mensal_sku_detalhe)):
+        row = primeira_sku_detalhe_row + i
+        mes_val = mensal_sku_detalhe.iloc[i].get("Mês", "")
         if resultado.get("modo_periodo") == "mensal" and pd.notna(mes_val):
             try:
                 ws.write_datetime(row, 1, pd.Timestamp(mes_val).to_pydatetime(), fmt_date)
@@ -6385,24 +6516,16 @@ def escrever_categoria(writer, nome_aba: str, resultado: Dict[str, object]):
                 ws.write(row, 1, str(mes_val), fmt_text)
         else:
             ws.write(row, 1, str(mes_val), fmt_text)
-        write_number_ou_branco(ws, row, 2, mensal.iloc[i].get("Sell-in SKU em Comum", np.nan), fmt_num)
-        write_number_ou_branco(ws, row, 3, mensal.iloc[i].get("Sell-out SKU em Comum", np.nan), fmt_num)
-        if resultado.get("modo_periodo") == "mensal":
-            if i < MESES_MAT - 1:
-                ws.write_blank(row, 4, None, fmt_pct)
-            else:
-                linha_excel = row + 1
-                linha_inicio = linha_excel - MESES_MAT + 1
-                formula_comum = f'=IFERROR(SUM(D{linha_inicio}:D{linha_excel})/SUM(C{linha_inicio}:C{linha_excel}),"")'
-                valor_comum = mensal.iloc[i].get("Cobertura SKU em Comum", np.nan)
-                ws.write_formula(row, 4, formula_comum, fmt_pct, float(valor_comum) if pd.notna(valor_comum) else "")
-        else:
-            write_number_ou_branco(ws, row, 4, mensal.iloc[i].get("Cobertura SKU em Comum", np.nan), fmt_pct)
+        write_number_ou_branco(ws, row, 2, mensal_sku_detalhe.iloc[i].get("Sell-in SKU em Comum", np.nan), fmt_num)
+        write_number_ou_branco(ws, row, 3, mensal_sku_detalhe.iloc[i].get("Sell-out SKU em Comum", np.nan), fmt_num)
+        linha_excel = row + 1
+        valor_comum = mensal_sku_detalhe.iloc[i].get("Cobertura SKU em Comum", np.nan)
+        ws.write_formula(row, 4, f'=IFERROR(D{linha_excel}/C{linha_excel},"")', fmt_pct, float(valor_comum) if pd.notna(valor_comum) else "")
 
     # Tabela dos SKUs excluídos do cálculo de SKU em comum.
     # Estes são os SKUs que aparecem em apenas uma das bases e, por isso,
     # não entram no bloco "SKU em Comum".
-    excluidos_title_row = primeira_sku_row + len(mensal) + 2
+    excluidos_title_row = primeira_sku_detalhe_row + len(mensal_sku_detalhe) + 2
     ws.merge_range(excluidos_title_row, 1, excluidos_title_row, 7, "SKUs excluídos do cálculo de SKU em Comum", fmt_secao)
     excluidos_header_row = excluidos_title_row + 1
     excluidos_cols = ["SKU", "Status", "Sell-in", "Sell-out", "Nome SKU", "Marca", "Fabricante"]
@@ -6425,20 +6548,20 @@ def escrever_categoria(writer, nome_aba: str, resultado: Dict[str, object]):
         excluidos_fim_row = excluidos_header_row + len(skus_excluidos)
 
     # Gráfico do SKU em comum abaixo da tabela de SKU em comum e da lista de excluídos.
-    if len(mensal) > 0:
-        last_sku_row = primeira_sku_row + len(mensal) - 1
+    if len(mensal_sku_detalhe) > 0:
+        last_sku_row = primeira_sku_detalhe_row + len(mensal_sku_detalhe) - 1
         chart_comum_row = excluidos_fim_row + 2
         chart_comum = workbook.add_chart({"type": "line"})
         chart_comum.add_series({
             "name": "Sell-in SKU em comum",
-            "categories": [nome_aba, primeira_sku_row, 1, last_sku_row, 1],
-            "values": [nome_aba, primeira_sku_row, 2, last_sku_row, 2],
+            "categories": [nome_aba, primeira_sku_detalhe_row, 1, last_sku_row, 1],
+            "values": [nome_aba, primeira_sku_detalhe_row, 2, last_sku_row, 2],
             "line": {"color": azul_linha, "width": 2.25},
         })
         chart_comum.add_series({
             "name": "Sell-out SKU em comum",
-            "categories": [nome_aba, primeira_sku_row, 1, last_sku_row, 1],
-            "values": [nome_aba, primeira_sku_row, 3, last_sku_row, 3],
+            "categories": [nome_aba, primeira_sku_detalhe_row, 1, last_sku_row, 1],
+            "values": [nome_aba, primeira_sku_detalhe_row, 3, last_sku_row, 3],
             "line": {"color": laranja_linha, "width": 2.25},
         })
         chart_comum.set_title({"name": "Sell-in SKU em Comum x Sell-out SKU em Comum", "name_font": {"color": "#000000", "size": 14, "bold": True}})
@@ -6541,8 +6664,8 @@ def gerar_descricao_calculos() -> pd.DataFrame:
         {
             "Nome da aba": "Abas de categoria/PROD",
             "Nome da coluna calculada": "Sell-in SKU em Comum / Sell-out SKU em Comum / Cobertura SKU em Comum",
-            "Explicação": "Mostra a cobertura mensal considerando apenas os SKUs que existem simultaneamente no Sell-in e no Sell-out.",
-            "Como foi calculado": "Primeiro identifica os SKUs/EANs em comum na categoria/PROD. Depois soma mensalmente o Sell-in e o Sell-out apenas desses SKUs. A Cobertura SKU em Comum usa 12 meses móveis: SOMA(Sell-out SKU em Comum 12M) / SOMA(Sell-in SKU em Comum 12M).",
+            "Explicação": "Mostra a cobertura considerando apenas os SKUs que existem simultaneamente no Sell-in e no Sell-out.",
+            "Como foi calculado": "O bloco SKU em Comum usa o mesmo período definido na tabela superior da aba, tanto no período anterior quanto no atual. A única diferença é restringir as somas aos SKUs/EANs em comum dentro de cada período; depois calcula Sell-out em comum / Sell-in em comum.",
         },
         {
             "Nome da aba": "Abas de categoria/PROD",
@@ -7510,11 +7633,29 @@ def gerar_excel(
 
         # Parâmetros
         if output_options.get("parametros", True):
-            parametros_df = pd.DataFrame([{"Parâmetro": k, "Valor": v} for k, v in parametros.items()])
+            detalhe_divisor = parametros.get("__detalhe_divisor_categoria__", [])
+            parametros_visiveis = {k: v for k, v in parametros.items() if not str(k).startswith("__")}
+            parametros_df = pd.DataFrame([{"Parâmetro": k, "Valor": v} for k, v in parametros_visiveis.items()])
             parametros_df.to_excel(writer, sheet_name="Parâmetros", index=False, startrow=1)
             ws = writer.sheets["Parâmetros"]
             ws.merge_range("A1:B1", "Parâmetros usados", fmt_titulo)
             aplicar_formatos_basicos(writer, "Parâmetros", parametros_df, startrow=1, startcol=0)
+
+            # Divisor por categoria: uma linha por categoria/PROD, para não ficar acumulado em uma única célula.
+            if isinstance(detalhe_divisor, list) and detalhe_divisor:
+                divisor_df = pd.DataFrame(detalhe_divisor).copy()
+                divisor_df = divisor_df.rename(columns={"Divisor": "Divisor aplicado"})
+                colunas_divisor = [c for c in ["Categoria", "Coluna ajustada", "Divisor aplicado", "Ratio antes", "Ratio depois", "Status"] if c in divisor_df.columns]
+                divisor_df = divisor_df[colunas_divisor]
+                start_divisor = len(parametros_df) + 4
+                ws.merge_range(start_divisor, 0, start_divisor, max(len(colunas_divisor) - 1, 1), "Divisor aplicado na volumetria por categoria", fmt_titulo)
+                divisor_df.to_excel(writer, sheet_name="Parâmetros", index=False, startrow=start_divisor + 1, startcol=0)
+                aplicar_formatos_basicos(
+                    writer, "Parâmetros", divisor_df, startrow=start_divisor + 1, startcol=0,
+                    number_cols={"Divisor aplicado", "Ratio antes", "Ratio depois"},
+                )
+                ws.set_column(0, 0, 34)
+                ws.set_column(1, max(len(colunas_divisor) - 1, 1), 18)
 
         # Descrição dos cálculos
         if output_options.get("descricao_calculos", True):
@@ -8542,6 +8683,7 @@ def detectar_e_ajustar_volumetria(
         "Coluna ajustada": "Nenhuma",
         "Divisor aplicado": 1,
         "Divisor aplicado por categoria": "",
+        "Detalhe divisor por categoria": [],
         "Volumetria final comparativa": "Sem alteração",
         "Mediana Sell-out/Sell-in antes do ajuste": np.nan,
         "Mediana Sell-out/Sell-in após o ajuste": np.nan,
@@ -8668,6 +8810,7 @@ def detectar_e_ajustar_volumetria(
         return f"{r.get('Categoria', '')}: {r.get('Coluna ajustada')} ÷ {divisor:g}"
 
     info["Divisor aplicado por categoria"] = "; ".join(fmt_registro(r) for r in registros)
+    info["Detalhe divisor por categoria"] = registros
     info["Critério"] = f"Inferência por categoria/PROD. Categorias avaliadas: {len(registros)}. Ajustes aplicados: {len(ajustes)}."
 
     if ajustes:
@@ -8969,7 +9112,8 @@ def executar_estudo(
         "Ajuste volumetria aplicado": str(info_volumetria.get("Ajuste volumetria aplicado", "Não")),
         "Coluna ajustada por volumetria": str(info_volumetria.get("Coluna ajustada", "Nenhuma")),
         "Divisor aplicado na volumetria": str(info_volumetria.get("Divisor aplicado", 1)),
-        "Divisor aplicado na volumetria por categoria": str(info_volumetria.get("Divisor aplicado por categoria", "")),
+        "Divisor aplicado na volumetria por categoria": "Ver tabela abaixo na aba Parâmetros",
+        "__detalhe_divisor_categoria__": info_volumetria.get("Detalhe divisor por categoria", []),
         "Escala/volumetria comparativa final": str(info_volumetria.get("Volumetria final comparativa", "Sem alteração")),
         "Mediana Sell-out/Sell-in antes do ajuste": str(info_volumetria.get("Mediana Sell-out/Sell-in antes do ajuste", "")),
         "Mediana Sell-out/Sell-in após ajuste": str(info_volumetria.get("Mediana Sell-out/Sell-in após o ajuste", "")),
@@ -9304,7 +9448,8 @@ def executar_cobertura_dash(
         "Ajuste volumetria aplicado": str(info_volumetria.get("Ajuste volumetria aplicado", "Não")),
         "Coluna ajustada por volumetria": str(info_volumetria.get("Coluna ajustada", "Nenhuma")),
         "Divisor aplicado na volumetria": str(info_volumetria.get("Divisor aplicado", 1)),
-        "Divisor aplicado na volumetria por categoria": str(info_volumetria.get("Divisor aplicado por categoria", "")),
+        "Divisor aplicado na volumetria por categoria": "Ver tabela abaixo na aba Parâmetros",
+        "__detalhe_divisor_categoria__": info_volumetria.get("Detalhe divisor por categoria", []),
         "Escala/volumetria comparativa final": str(info_volumetria.get("Volumetria final comparativa", "Sem alteração")),
         "Mediana comparativa antes do ajuste": str(info_volumetria.get("Mediana Sell-out/Sell-in antes do ajuste", "")),
         "Mediana comparativa após ajuste": str(info_volumetria.get("Mediana Sell-out/Sell-in após o ajuste", "")),
@@ -9343,6 +9488,8 @@ ABAS_SISTEMA_COMPARACAO = {
         "Resumo Categorias",
         "Base SKUs",
         "SKUs por Categoria",
+        "Gráficos Cobertura",
+        "Graficos Cobertura",
         "Base Contribuição Sell-out",
         "Base Contribuicao Sell-out",
         "Crosschecks",
@@ -9351,8 +9498,6 @@ ABAS_SISTEMA_COMPARACAO = {
         "Avisos",
         "Descrição Cálculos",
         "Descricao Calculos",
-        "Gráficos Cobertura",
-        "Graficos Cobertura",
     ]
 }
 
@@ -11434,7 +11579,6 @@ def executar_estudo_dois_sellouts(
         "avisos": True,
         "abas_auxiliares_comparacao": True,
         "top20_sku_canal_uf": gerar_top20_sku_canal_uf,
-        "graficos_cobertura": False,
     })
 
     nivel_norm = str(nivel or "").upper()
