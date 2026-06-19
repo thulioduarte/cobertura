@@ -841,6 +841,154 @@ def filtrar_bases_sku_12m_por_categoria(sellin: pd.DataFrame, sellout: pd.DataFr
     return si_out, so_out
 
 
+
+def _periodos_base_sku_por_categoria(sellin: pd.DataFrame, sellout: pd.DataFrame) -> Dict[str, Dict[str, object]]:
+    """
+    Define, por categoria/PROD, os períodos auxiliares da Base SKUs.
+
+    Regras:
+    - Último ano fechado: último ano civil completo existente no intervalo comum de Sell-in e Sell-out.
+    - MAT 12M: últimos 12 meses encerrados no último mês comum entre Sell-in e Sell-out.
+    - Em bases sem mês, o último ano fechado usa o maior ano comum disponível e MAT fica em branco.
+    """
+    si = sellin.copy() if sellin is not None else pd.DataFrame()
+    so = sellout.copy() if sellout is not None else pd.DataFrame()
+    if si.empty and so.empty:
+        return {}
+
+    cats = sorted(
+        set(si.get("categoria_key", pd.Series(dtype=str)).dropna().astype(str)) |
+        set(so.get("categoria_key", pd.Series(dtype=str)).dropna().astype(str))
+    )
+    periodos: Dict[str, Dict[str, object]] = {}
+
+    for cat in cats:
+        si_cat = si[si.get("categoria_key", pd.Series(dtype=str)).astype(str) == cat].copy() if not si.empty and "categoria_key" in si.columns else pd.DataFrame()
+        so_cat = so[so.get("categoria_key", pd.Series(dtype=str)).astype(str) == cat].copy() if not so.empty and "categoria_key" in so.columns else pd.DataFrame()
+        info: Dict[str, object] = {
+            "ano_fechado_label": "",
+            "ano_fechado_inicio": pd.NaT,
+            "ano_fechado_fim": pd.NaT,
+            "ano_fechado_ano": np.nan,
+            "mat_label": "",
+            "mat_inicio": pd.NaT,
+            "mat_fim": pd.NaT,
+        }
+
+        tem_mes_si = (not si_cat.empty) and "mes" in si_cat.columns and si_cat["mes"].notna().any()
+        tem_mes_so = (not so_cat.empty) and "mes" in so_cat.columns and so_cat["mes"].notna().any()
+        if tem_mes_si and tem_mes_so:
+            si_cat["_mes_calc"] = pd.to_datetime(si_cat["mes"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            so_cat["_mes_calc"] = pd.to_datetime(so_cat["mes"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            min_si, max_si = si_cat["_mes_calc"].dropna().min(), si_cat["_mes_calc"].dropna().max()
+            min_so, max_so = so_cat["_mes_calc"].dropna().min(), so_cat["_mes_calc"].dropna().max()
+            if pd.notna(min_si) and pd.notna(min_so) and pd.notna(max_si) and pd.notna(max_so):
+                inicio_comum = max(min_si, min_so).to_period("M").to_timestamp()
+                fim_comum = min(max_si, max_so).to_period("M").to_timestamp()
+                meses_comuns = meses_entre(inicio_comum, fim_comum)
+                if meses_comuns:
+                    meses_set = {pd.Timestamp(m).to_period("M").to_timestamp() for m in meses_comuns}
+                    anos_completos = []
+                    for ano in sorted({pd.Timestamp(m).year for m in meses_set}):
+                        esperado = {pd.Timestamp(year=ano, month=mes, day=1) for mes in range(1, 13)}
+                        if esperado.issubset(meses_set):
+                            anos_completos.append(ano)
+                    if anos_completos:
+                        ano = int(max(anos_completos))
+                        info["ano_fechado_inicio"] = pd.Timestamp(year=ano, month=1, day=1)
+                        info["ano_fechado_fim"] = pd.Timestamp(year=ano, month=12, day=1)
+                        info["ano_fechado_ano"] = ano
+                        info["ano_fechado_label"] = f"FY {ano}"
+
+                    if len(meses_comuns) >= MESES_MAT:
+                        fim_mat = pd.Timestamp(fim_comum).to_period("M").to_timestamp()
+                        inicio_mat = (fim_mat - pd.DateOffset(months=MESES_MAT - 1)).to_period("M").to_timestamp()
+                        info["mat_inicio"] = inicio_mat
+                        info["mat_fim"] = fim_mat
+                        info["mat_label"] = f"{formatar_periodo(inicio_mat)} a {formatar_periodo(fim_mat)}"
+
+        # Fallback anual: usado quando não há mês em ambos os lados.
+        if not info["ano_fechado_label"]:
+            if "ano" in si_cat.columns and "ano" in so_cat.columns:
+                anos_si = set(pd.to_numeric(si_cat["ano"], errors="coerce").dropna().astype(int).tolist())
+                anos_so = set(pd.to_numeric(so_cat["ano"], errors="coerce").dropna().astype(int).tolist())
+                anos_comuns = sorted(anos_si & anos_so)
+                if anos_comuns:
+                    ano = int(max(anos_comuns))
+                    info["ano_fechado_inicio"] = pd.Timestamp(year=ano, month=1, day=1)
+                    info["ano_fechado_fim"] = pd.Timestamp(year=ano, month=12, day=1)
+                    info["ano_fechado_ano"] = ano
+                    info["ano_fechado_label"] = f"FY {ano}"
+
+        periodos[cat] = info
+    return periodos
+
+
+def _agrupar_volume_sku_periodo(
+    df: pd.DataFrame,
+    valor_col: str,
+    periodos: Dict[str, Dict[str, object]],
+    periodo: str,
+    nome_coluna: str,
+) -> pd.DataFrame:
+    """Soma volume por categoria+SKU para o período informado em _periodos_base_sku_por_categoria."""
+    colunas_saida = ["categoria_key", "ean", nome_coluna]
+    if df is None or df.empty or "categoria_key" not in df.columns or "ean" not in df.columns or valor_col not in df.columns:
+        return pd.DataFrame(columns=colunas_saida)
+
+    partes = []
+    base = df.copy()
+    base[valor_col] = pd.to_numeric(base[valor_col], errors="coerce").fillna(0)
+
+    for cat, info in (periodos or {}).items():
+        cat_df = base[base["categoria_key"].astype(str) == str(cat)].copy()
+        if cat_df.empty:
+            continue
+
+        if periodo == "ano_fechado":
+            inicio = info.get("ano_fechado_inicio", pd.NaT)
+            fim = info.get("ano_fechado_fim", pd.NaT)
+            ano = info.get("ano_fechado_ano", np.nan)
+        else:
+            inicio = info.get("mat_inicio", pd.NaT)
+            fim = info.get("mat_fim", pd.NaT)
+            ano = np.nan
+
+        if pd.notna(inicio) and pd.notna(fim) and "mes" in cat_df.columns and cat_df["mes"].notna().any():
+            cat_df["_mes_calc"] = pd.to_datetime(cat_df["mes"], errors="coerce").dt.to_period("M").dt.to_timestamp()
+            cat_df = cat_df[(cat_df["_mes_calc"] >= inicio) & (cat_df["_mes_calc"] <= fim)].copy()
+        elif periodo == "ano_fechado" and pd.notna(ano) and "ano" in cat_df.columns:
+            cat_df["_ano_calc"] = pd.to_numeric(cat_df["ano"], errors="coerce")
+            cat_df = cat_df[cat_df["_ano_calc"] == int(ano)].copy()
+        else:
+            cat_df = cat_df.iloc[0:0].copy()
+
+        if cat_df.empty:
+            continue
+        partes.append(
+            cat_df.groupby(["categoria_key", "ean"], as_index=False)[valor_col]
+            .sum()
+            .rename(columns={valor_col: nome_coluna})
+        )
+
+    if not partes:
+        return pd.DataFrame(columns=colunas_saida)
+    out = pd.concat(partes, ignore_index=True)
+    out = out.groupby(["categoria_key", "ean"], as_index=False)[nome_coluna].sum()
+    return out[colunas_saida]
+
+
+def _labels_periodos_base_sku(periodos: Dict[str, Dict[str, object]]) -> pd.DataFrame:
+    linhas = []
+    for cat, info in (periodos or {}).items():
+        linhas.append({
+            "categoria_key": cat,
+            "Período Último Ano Fechado": info.get("ano_fechado_label", ""),
+            "Período MAT 12M": info.get("mat_label", ""),
+        })
+    return pd.DataFrame(linhas, columns=["categoria_key", "Período Último Ano Fechado", "Período MAT 12M"])
+
+
 def montar_skus_excluidos_em_comum(si: pd.DataFrame, so: pd.DataFrame) -> pd.DataFrame:
     """
     Lista os SKUs que ficaram fora do cálculo de SKU em comum.
@@ -5948,6 +6096,22 @@ def calcular_cobertura_categoria(
 
 def preparar_skus(sellin: pd.DataFrame, sellout: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Cria detalhe de SKUs e resumo por categoria usando apenas Sell-in e Sell-out."""
+    periodos_sku = _periodos_base_sku_por_categoria(sellin, sellout)
+    labels_periodos_sku = _labels_periodos_base_sku(periodos_sku)
+
+    si_sku_ano_fechado = _agrupar_volume_sku_periodo(
+        sellin, "valor_sellin", periodos_sku, "ano_fechado", "Volume Sell-in Último Ano Fechado"
+    )
+    so_sku_ano_fechado = _agrupar_volume_sku_periodo(
+        sellout, "valor_sellout", periodos_sku, "ano_fechado", "Volume Sell-out Último Ano Fechado"
+    )
+    si_sku_mat = _agrupar_volume_sku_periodo(
+        sellin, "valor_sellin", periodos_sku, "mat", "Volume Sell-in MAT 12M"
+    )
+    so_sku_mat = _agrupar_volume_sku_periodo(
+        sellout, "valor_sellout", periodos_sku, "mat", "Volume Sell-out MAT 12M"
+    )
+
     si_sku = (
         sellin.groupby(["categoria_key", "categoria", "ean"], as_index=False)
         .agg(Volume_Sellin_SKU=("valor_sellin", "sum"))
@@ -6006,9 +6170,25 @@ def preparar_skus(sellin: pd.DataFrame, sellout: pd.DataFrame) -> Tuple[pd.DataF
     detalhe = detalhe.merge(so_total_sku, on=["categoria_key", "categoria", "ean"], how="left")
     detalhe = detalhe.merge(so_sku_principal, on=["categoria_key", "ean"], how="left")
     detalhe = detalhe.merge(fab_ref, on="categoria_key", how="left")
+    detalhe = detalhe.merge(labels_periodos_sku, on="categoria_key", how="left")
+    detalhe = detalhe.merge(si_sku_ano_fechado, on=["categoria_key", "ean"], how="left")
+    detalhe = detalhe.merge(so_sku_ano_fechado, on=["categoria_key", "ean"], how="left")
+    detalhe = detalhe.merge(si_sku_mat, on=["categoria_key", "ean"], how="left")
+    detalhe = detalhe.merge(so_sku_mat, on=["categoria_key", "ean"], how="left")
 
     detalhe["Volume_Sellin_SKU"] = pd.to_numeric(detalhe["Volume_Sellin_SKU"], errors="coerce").fillna(0)
     detalhe["Volume_Sellout_SKU"] = pd.to_numeric(detalhe["Volume_Sellout_SKU"], errors="coerce").fillna(0)
+    for col in [
+        "Volume Sell-in Último Ano Fechado", "Volume Sell-out Último Ano Fechado",
+        "Volume Sell-in MAT 12M", "Volume Sell-out MAT 12M",
+    ]:
+        if col not in detalhe.columns:
+            detalhe[col] = 0.0
+        detalhe[col] = pd.to_numeric(detalhe[col], errors="coerce").fillna(0.0)
+    for col in ["Período Último Ano Fechado", "Período MAT 12M"]:
+        if col not in detalhe.columns:
+            detalhe[col] = ""
+        detalhe[col] = detalhe[col].fillna("").astype(str)
     detalhe["fabricante"] = detalhe["fabricante"].fillna("")
     detalhe["marca"] = detalhe["marca"].fillna("")
     detalhe["Nome_SKU"] = detalhe["Nome_SKU"].fillna("")
@@ -6109,6 +6289,8 @@ def preparar_skus(sellin: pd.DataFrame, sellout: pd.DataFrame) -> Tuple[pd.DataF
         "Categoria", "SKU", "Nome_SKU", "Marca", "Fabricante", "Fabricante referência Sell-in",
         "Está no Sell-in Cliente", "Está no nosso Sell-out", "Está no SKU SM/Publicar", "SKU em comum",
         "Dentro do fabricante Sell-in", "SKU em comum no fabricante Sell-in", "Status SKU",
+        "Período Último Ano Fechado", "Volume Sell-in Último Ano Fechado", "Volume Sell-out Último Ano Fechado",
+        "Período MAT 12M", "Volume Sell-in MAT 12M", "Volume Sell-out MAT 12M",
         "Volume Sell-in SKU", "Volume Sell-out SKU", "Volume Sell-out Referência SKU", "Volume Sell-out Fab. Sell-in SKU",
         "Importância Sell-in SKU", "Importância Sell-out SKU", "Importância Sell-out SKU Fab. Sell-in",
         "categoria_key",
@@ -6644,6 +6826,18 @@ def gerar_descricao_calculos() -> pd.DataFrame:
             "Nome da coluna calculada": "Dentro do fabricante Sell-in",
             "Explicação": "Indica se o SKU pertence ao fabricante de referência do Sell-in.",
             "Como foi calculado": "Compara o fabricante do SKU no Sell-out com o Fabricante referência Sell-in da categoria.",
+        },
+        {
+            "Nome da aba": "Base SKUs",
+            "Nome da coluna calculada": "Volume Sell-in Último Ano Fechado / Volume Sell-out Último Ano Fechado",
+            "Explicação": "Mostra o volume do SKU no último ano civil fechado comum entre Sell-in e Sell-out, mantendo Sell-in e Sell-out lado a lado no mesmo período.",
+            "Como foi calculado": "Para cada categoria/PROD, identifica o último ano com janeiro a dezembro dentro do intervalo comum entre Sell-in e Sell-out e soma o volume do SKU nesse ano. Em bases sem mês, usa o maior ano comum disponível.",
+        },
+        {
+            "Nome da aba": "Base SKUs",
+            "Nome da coluna calculada": "Volume Sell-in MAT 12M / Volume Sell-out MAT 12M",
+            "Explicação": "Mostra o volume do SKU nos últimos 12 meses comuns, mantendo Sell-in e Sell-out lado a lado no mesmo período.",
+            "Como foi calculado": "Para cada categoria/PROD, usa os 12 meses encerrados no último mês comum entre Sell-in e Sell-out. Se não houver 12 meses mensais, o campo fica sem período aplicável.",
         },
         {
             "Nome da aba": "Base SKUs",
@@ -7511,7 +7705,11 @@ def gerar_excel(
             aplicar_formatos_basicos(
                 writer, "Base SKUs", detalhe_skus, startrow=1, startcol=0,
                 percent_cols={"Importância Sell-in SKU", "Importância Sell-out SKU", "Importância Sell-out SKU Fab. Sell-in"},
-                number_cols={"Volume Sell-in SKU", "Volume Sell-out SKU", "Volume Sell-out Fab. Sell-in SKU"},
+                number_cols={
+                    "Volume Sell-in Último Ano Fechado", "Volume Sell-out Último Ano Fechado",
+                    "Volume Sell-in MAT 12M", "Volume Sell-out MAT 12M",
+                    "Volume Sell-in SKU", "Volume Sell-out SKU", "Volume Sell-out Fab. Sell-in SKU"
+                },
             )
 
         # Base auxiliar para contribuição SKU 2.0 x 3.0.
